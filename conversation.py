@@ -61,12 +61,14 @@ class GrokConversationAgent(conversation.AbstractConversationAgent):
         _LOGGER.debug(f"Entry data keys: {list(entry.data.keys())}")  # Masked sensitive data
         self.api_key = api_key
         self.model = model
-        self.prompt = prompt or DEFAULT_PROMPT
+        self.ha_tools = GrokHaTool(self.hass)  # Instantiate early
+        tool_instructions = '; '.join(self.ha_tools.generate_tool_instructions())
+        self.prompt = (prompt or DEFAULT_PROMPT).replace("use available tools as specified.",
+            f"use these tools: {tool_instructions}.")        
         self.client = AsyncClient(self.api_key)
         self.conversations: Dict[str, ConversationContext] = {}
         self._lock = asyncio.Lock()
         self.rate_limiter = asyncio.Semaphore(MAX_API_CALLS_PER_MIN)  # Rate limiting
-        self.ha_tools = GrokHaTool(self.hass)
         self.tools = self.ha_tools.get_tool_schemas()
         
     async def _async_cleanup_loop(self) -> None:
@@ -94,10 +96,10 @@ class GrokConversationAgent(conversation.AbstractConversationAgent):
         conversation_id = user_input.conversation_id or str(uuid.uuid4())
         _LOGGER.debug(f"=== Processing input for conversation_id: {conversation_id}, text: {user_input.text}")
     
-        try:
+        try: # Main try for overall process
             # Fetch area from context (e.g., voice satellite device_id)
             area_name = "unknown"
-            try:
+            try: # Nested for area fetch
                 if user_input.context:
                     device_id = getattr(user_input.context, 'device_id', None)  # Safe getattr
                     if not device_id:
@@ -111,7 +113,11 @@ class GrokConversationAgent(conversation.AbstractConversationAgent):
                             if area:
                                 area_name = area.name
                                 _LOGGER.debug(f"Fetched area from device_id: {area_name}")
-            except Exception as e:
+                                
+            except AttributeError as ae:
+                _LOGGER.warning(f"Attribute error in context fetch: {ae}")
+                area_name = "unknown"
+            except Exception as e:  # Broad fallback
                 _LOGGER.warning(f"Failed to fetch area context: {str(e)}")  # Graceful fallback
     
             area_context = AREA_CONTEXT_TEMPLATE.format(area=area_name) if area_name != "unknown" else ""
@@ -222,10 +228,16 @@ class GrokConversationAgent(conversation.AbstractConversationAgent):
                 response=intent_response,
                 conversation_id=conversation_id,
             )
-            
-        except Exception as e:
-            _LOGGER.error(f"Conversation processing failed: {str(e)}", exc_info=True)
-            intent_response = intent.IntentResponse(language=user_input.language)
-            intent_response.async_set_speech(f"Error: {str(e)}")
-            return conversation.ConversationResult(response=intent_response, conversation_id=conversation_id)
         
+        except openai.APIError as api_err:
+            _LOGGER.error(f"xAI API error: {api_err}", exc_info=True)
+            await self.hass.services.async_call("persistent_notification", "create", {"message": f"API Error: {api_err}"})
+            intent_response.async_set_speech("API connection issue; please check your key.")
+        except asyncio.TimeoutError as te:
+            _LOGGER.error(f"Timeout in processing: {te}", exc_info=True)
+            intent_response.async_set_speech("Request timed out; try again later.")
+        except Exception as e:
+            _LOGGER.critical(f"Unexpected error: {e}", exc_info=True)
+            intent_response.async_set_speech("An error occurred; check logs.")
+            return conversation.ConversationResult(response=intent_response, conversation_id=conversation_id)    
+ 

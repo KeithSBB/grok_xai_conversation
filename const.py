@@ -4,31 +4,32 @@ This file centralizes all static values used across the integration, such as dom
 default models, prompts, and API configurations. This promotes modularity and reduces
 hard-coding in other files like conversation.py and config_flow.py.
 """
+import logging
+
+_LOGGER = logging.getLogger(__name__)
 
 # Integration domain identifier
-DOMAIN: str = "grok_xai_conversation"
+DOMAIN = "grok_xai_conversation"
 
 # Default xAI model (updated to official xAI SDK-compatible value; fallback for config)
-DEFAULT_MODEL: str = "grok-beta"
+DEFAULT_MODEL = "grok-beta"
 
 # List of supported models for options flow (enables multi-model toggle)
 MODEL_OPTIONS = ["grok-beta", "grok-4", "grok-code-fast-1", "grok-4-fast-non-reasoning"]  # From xAI docs; extend as new models release
 
-
-# Default system prompt for Grok conversation agent
-# Dynamically includes tool instructions; area_context is appended separately at runtime
-# Enhanced with disambiguation instruction
-DEFAULT_PROMPT: str = (
-    f"You are Grok, a helpful home automation assistant built by xAI. "
-    f"For device control, use these tools: {'; '.join(TOOL_INSTRUCTIONS)}. "
-    f"If multiple entities match (e.g., lights in different areas), use provided area context to disambiguate or ask user for clarification. "
-    f"Example: For lights, use 'call_ha_service' with domain 'light', service 'turn_on', "
-    f"target as a JSON object with entity_id set to 'light.bedroom', data as a JSON object with brightness_pct set to 50. "
-    f"For general queries, provide concise, accurate answers."
+# Default system prompt for Grok conversation agent (tool instructions injected dynamically)
+# Area_context is appended separately at runtime; enhanced with disambiguation instruction
+DEFAULT_PROMPT = (
+    "You are Grok, a helpful home automation assistant built by xAI. "
+    "For device control, use available tools as specified. "
+    "If multiple entities match (e.g., lights in different areas), use provided area context to disambiguate or ask user for clarification. "
+    "Example: For lights, use 'call_ha_service' with domain 'light', service 'turn_on', "
+    "target as a JSON object with entity_id set to 'light.bedroom', data as a JSON object with brightness_pct set to 50. "
+    "For general queries, provide concise, accurate answers."
 ).strip()  # Clean whitespace
 
 # xAI API base URL (for client initialization in conversation.py)
-API_BASE_URL: str = "https://api.x.ai/v1"
+API_BASE_URL = "https://api.x.ai/v1"
 
 # Default API timeout in seconds (used in async calls for robustness)
 DEFAULT_API_TIMEOUT = 30
@@ -45,10 +46,10 @@ MAX_SEARCH_RESULTS = 10
 CLEANUP_INTERVAL = 60
 
 # Default log level for integration (can be overridden in config)
-DEFAULT_LOG_LEVEL: str = "DEBUG"
+DEFAULT_LOG_LEVEL = "DEBUG"
 
 # Template for area context (used in conversation.py)
-AREA_CONTEXT_TEMPLATE: str = "The user is speaking from the {area} area. Use this to disambiguate entities if needed."
+AREA_CONTEXT_TEMPLATE = "The user is speaking from the {area} area. Use this to disambiguate entities if needed."
 
 # Config keys
 CONF_API_KEY = "api_key"
