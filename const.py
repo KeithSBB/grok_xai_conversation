@@ -1,30 +1,39 @@
 """Constants for the Grok xAI Conversation integration.
 
-This file centralizes all static values used across the integration, such as domain,
-default models, prompts, and API configurations. This promotes modularity and reduces
-hard-coding in other files like conversation.py and config_flow.py.
+This file centralizes all static values used across the integration, s
+uch as domain, default models, prompts, and API configurations. This promotes
+modularity and reduces hard-coding in other files like conversation.py
+and config_flow.py.
 """
-import logging
-
-_LOGGER = logging.getLogger(__name__)
 
 # Integration domain identifier
 DOMAIN = "grok_xai_conversation"
 
-# Default xAI model (updated to official xAI SDK-compatible value; fallback for config)
+# Default xAI model
+#  (updated to official xAI SDK-compatible value; fallback for config)
 DEFAULT_MODEL = "grok-beta"
 
 # List of supported models for options flow (enables multi-model toggle)
-MODEL_OPTIONS = ["grok-beta", "grok-4", "grok-code-fast-1", "grok-4-fast-non-reasoning"]  # From xAI docs; extend as new models release
+MODEL_OPTIONS = [
+    "grok-beta",
+    "grok-4",
+    "grok-code-fast-1",
+    "grok-4-fast-non-reasoning",
+]  # From xAI docs; extend as new models release
 
-# Default system prompt for Grok conversation agent (tool instructions injected dynamically)
-# Area_context is appended separately at runtime; enhanced with disambiguation instruction
+# Default system prompt for Grok conversation agent
+#   (tool instructions injected dynamically)
+# Area_context is appended separately at runtime;
+#   enhanced with disambiguation instruction
 DEFAULT_PROMPT = (
     "You are Grok, a helpful home automation assistant built by xAI. "
     "For device control, use available tools as specified. "
-    "If multiple entities match (e.g., lights in different areas), use provided area context to disambiguate or ask user for clarification. "
-    "Example: For lights, use 'call_ha_service' with domain 'light', service 'turn_on', "
-    "target as a JSON object with entity_id set to 'light.bedroom', data as a JSON object with brightness_pct set to 50. "
+    "If multiple entities match (e.g., lights in different areas),"
+    "use provided area context to disambiguate or ask user for clarification. "
+    "Example: For lights, use 'call_ha_service' with domain 'light', "
+    "service 'turn_on', "
+    "target as a JSON object with entity_id set to 'light.bedroom',"
+    "data as a JSON object with brightness_pct set to 50. "
     "For general queries, provide concise, accurate answers."
 ).strip()  # Clean whitespace
 
@@ -49,7 +58,10 @@ CLEANUP_INTERVAL = 60
 DEFAULT_LOG_LEVEL = "DEBUG"
 
 # Template for area context (used in conversation.py)
-AREA_CONTEXT_TEMPLATE = "The user is speaking from the {area} area. Use this to disambiguate entities if needed."
+AREA_CONTEXT_TEMPLATE = (
+    "The user is speaking from the {area} area."
+    "Use this to disambiguate entities if needed."
+)
 
 # Config keys
 CONF_API_KEY = "api_key"
