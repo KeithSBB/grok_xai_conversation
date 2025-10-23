@@ -1,18 +1,19 @@
+"""The Grok xAI Conversation integration."""
+
 import asyncio
 import logging
 
-from homeassistant.components import conversation
+import xai_sdk
+from homeassistant.components import conversation as ha_conversation
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
+from .const import CONF_API_KEY, DEFAULT_MODEL, DEFAULT_PROMPT, DOMAIN
 from .conversation import GrokConversationAgent
 from .tools import GrokHaTool
 
-_LOGGER = logging.getLogger(__name__)  # This uses the module name as the logger
-
-# Example log statement (add one temporarily if needed to force emission)
-_LOGGER.info("Your Component loaded successfully")
+_LOGGER = logging.getLogger(__name__)
+_LOGGER.info(f"Grok integration is loading. xAI SDK version: {xai_sdk.__version__}")
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -20,26 +21,44 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Merge data and options, preferring options
     config = {**entry.data, **entry.options}
 
+    # Create a single instance of GrokHaTool and store it
+    ha_tools = GrokHaTool(hass)
+
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+        "ha_tools": ha_tools,
+    }
+
     # Now use config for everything
-    api_key = config["api_key"]
-    model = config.get("model", "grok-4-fast-non-reasoning")
-    prompt = config.get("prompt", "Your default prompt here...")
-    # TODO: remove: exposed_apis = config.get(CONF_LLM_HASS_API, [])
+    api_key = config[CONF_API_KEY]
+    model = config.get("model", DEFAULT_MODEL)
+    prompt = config.get("prompt", DEFAULT_PROMPT)
 
-    _LOGGER.debug("Setting up Grok xAI conversation agent with model: %s", model)
+    _LOGGER.info("Setting up Grok xAI conversation agent with model: %s", model)
 
-    # Register the LLM API
-    agent = GrokConversationAgent(hass, entry, api_key, model, prompt)
-    conversation.async_set_agent(hass, entry, agent)
-    # llm.async_register_api(hass, llm_api)
+    try:
+        agent = GrokConversationAgent(
+            hass=hass,
+            entry=entry,
+            api_key=api_key,
+            model=model,
+            prompt=prompt,
+            ha_tools=ha_tools,  # Pass the instance
+        )
+    except Exception as e:
+        _LOGGER.error(
+            "Failed to initialize GrokConversationAgent: %s", e, exc_info=True
+        )
+        # Clean up the partial data
+        hass.data[DOMAIN].pop(entry.entry_id)
+        if not hass.data[DOMAIN]:
+            hass.data.pop(DOMAIN)
+        return False
 
-    # Handle exposed APIs if needed
-    # e.g., for api_id in exposed_apis:
-    #     llm.async_expose_api(hass, api_id)  # Or whatever logic
+    ha_conversation.async_set_agent(hass, entry, agent)
 
     # Schedule the periodic cleanup task
-    cleanup_task = hass.loop.create_task(agent._async_cleanup_loop())
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"cleanup_task": cleanup_task}
+    cleanup_task = hass.async_create_task(agent.async_run_cleanup_loop())
+    hass.data[DOMAIN][entry.entry_id]["cleanup_task"] = cleanup_task
 
     # Add listener for options updates to reload
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
@@ -49,21 +68,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload config entry."""
+    _LOGGER.debug("Reloading Grok integration entry.")
     await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    conversation.async_unset_agent(hass, entry)
-    GrokHaTool.async_unload_listeners()
+    _LOGGER.info("Unloading Grok integration entry.")
+
+    # Unset the conversation agent
+    ha_conversation.async_unset_agent(hass, entry)
+
+    # Retrieve and clean up integration data
+    if DOMAIN not in hass.data or entry.entry_id not in hass.data[DOMAIN]:
+        return True  # Already unloaded
+
+    entry_data = hass.data[DOMAIN].pop(entry.entry_id)
+
+    # Unload tool listeners
+    if "ha_tools" in entry_data:
+        ha_tools: GrokHaTool = entry_data["ha_tools"]
+        ha_tools.async_unload_listeners()
+
     # Cancel the cleanup task
-    if DOMAIN in hass.data and entry.entry_id in hass.data[DOMAIN]:
-        cleanup_task = hass.data[DOMAIN][entry.entry_id].pop("cleanup_task", None)
-        if cleanup_task:
-            cleanup_task.cancel()
-            try:
-                await cleanup_task
-            except asyncio.CancelledError:
-                pass  # Expected on cancellation
+    if "cleanup_task" in entry_data:
+        cleanup_task: asyncio.Task[ConfigEntry] = entry_data["cleanup_task"]
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            _LOGGER.debug("Conversation cleanup task cancelled successfully.")
+
+    if not hass.data[DOMAIN]:
+        hass.data.pop(DOMAIN)
 
     return True

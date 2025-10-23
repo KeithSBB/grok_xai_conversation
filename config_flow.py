@@ -1,12 +1,25 @@
 import logging
-from typing import Any, Callable, cast
+from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.config_entries import AbortFlow, ConfigFlow, OptionsFlow
+
+try:
+    from homeassistant.config_entries import AbortFlow, ConfigFlow, OptionsFlow
+except ImportError:
+    from homeassistant.config_entries import ConfigFlow, OptionsFlow
+
+    class AbortFlow(Exception):  # type: ignore[no-redef]
+        def __init__(self, reason: str):
+            self.reason = reason
+
+
 from homeassistant.const import CONF_LLM_HASS_API
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import llm
+from homeassistant.helpers.selector import (
+    TextSelectorType,  # Ensure TextSelectorType is imported
+)
 from homeassistant.helpers.selector import (
     SelectOptionDict,
     SelectSelector,
@@ -14,14 +27,10 @@ from homeassistant.helpers.selector import (
     SelectSelectorMode,
     TextSelector,
     TextSelectorConfig,
-    TextSelectorType,
 )
-
-# Alias to avoid name clash
-from homeassistant.helpers.typing import callback as ha_callback
 from typing_extensions import ParamSpec, TypeVar
 
-from .const import DEFAULT_MODEL, DEFAULT_PROMPT, DOMAIN
+from .const import CONF_API_KEY, DEFAULT_MODEL, DEFAULT_PROMPT, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,16 +38,8 @@ P = ParamSpec("P")  # Represents parameter spec
 R = TypeVar("R")  # Represents return type
 
 
-def typed_callback(func: Callable[P, R]) -> Callable[P, R]:
-    """Typed wrapper for HA's @callback to satisfy mypy."""
-    return cast(Callable[P, R], ha_callback(func))
-
-
 class GrokConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[misc,call-arg]
-    """Grok xAI conversation config flow.
-
-    Handles initial setup and reconfiguration for the Grok integration.
-    """
+    """Grok xAI conversation config flow."""
 
     VERSION = 1
 
@@ -47,17 +48,8 @@ class GrokConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[misc,call-arg]
     ) -> config_entries.ConfigFlowResult:
         """Handle the initial user configuration step."""
         if user_input is not None:
-            # Set unique ID to prevent duplicate entries
             await self.async_set_unique_id(DOMAIN)
-            try:
-                self._abort_if_unique_id_configured()  # Check for duplicates
-            except AbortFlow as err:
-                _LOGGER.debug(
-                    "Aborted config flow: Unique ID already configured (reason: %s)",
-                    err.reason,
-                )
-                raise  # Re-raise to let HA handle the abort
-
+            self._abort_if_unique_id_configured()
             return self.async_create_entry(
                 title="Grok xAI Conversation", data=user_input
             )
@@ -66,7 +58,9 @@ class GrokConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[misc,call-arg]
             step_id="user",
             data_schema=vol.Schema(
                 {
-                    vol.Required("api_key"): str,
+                    vol.Required(CONF_API_KEY): TextSelector(
+                        TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                    ),
                 }
             ),
         )
@@ -95,12 +89,11 @@ class GrokConfigFlow(ConfigFlow, domain=DOMAIN):  # type: ignore[misc,call-arg]
         )
 
     @staticmethod
-    @typed_callback
     def async_get_options_flow(
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
         """Create and return the options flow handler."""
-        return GrokOptionsFlow(config_entry)
+        return GrokOptionsFlow()
 
 
 class GrokOptionsFlow(OptionsFlow):  # type: ignore[misc]
@@ -108,12 +101,6 @@ class GrokOptionsFlow(OptionsFlow):  # type: ignore[misc]
 
     Manages customizable options like model selection and prompts.
     """
-
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow with the config entry."""
-        self.config_entry = config_entry
-        self.entry_id = config_entry.entry_id
-        self.data = config_entry.data.copy()
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -159,7 +146,7 @@ class GrokOptionsFlow(OptionsFlow):  # type: ignore[misc]
                     label=api.name,
                     value=api.id,
                 )
-                for api in await llm.async_get_apis(hass)  # Await the async call
+                for api in llm.async_get_apis(hass)  # Await the async call
             ]
         except Exception as err:
             _LOGGER.warning("Failed to load LLM APIs: %s", err)
