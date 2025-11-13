@@ -3,17 +3,7 @@ from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
-
-try:
-    from homeassistant.config_entries import AbortFlow, ConfigFlow, OptionsFlow
-except ImportError:
-    from homeassistant.config_entries import ConfigFlow, OptionsFlow
-
-    class AbortFlow(Exception):  # type: ignore[no-redef]
-        def __init__(self, reason: str):
-            self.reason = reason
-
-
+from homeassistant.config_entries import ConfigFlow, OptionsFlow
 from homeassistant.const import CONF_LLM_HASS_API
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import llm

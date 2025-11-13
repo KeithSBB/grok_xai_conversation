@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import random
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -53,7 +54,11 @@ class ConversationContext:
 
 
 class GrokConversationAgent(AbstractConversationAgent):  # type: ignore
-    """Grok xAI conversation agent using xAI SDK."""
+    """Grok xAI conversation agent.
+
+    Inherits from HA's AbstractConversationAgent for conversation handling.
+    Manages chat contexts, tool calls, and API interactions.
+    """
 
     def __init__(
         self,
@@ -65,15 +70,24 @@ class GrokConversationAgent(AbstractConversationAgent):  # type: ignore
         prompt: Optional[str] = None,
     ) -> None:
         """Initialize the conversation agent."""
-        self.hass = hass
-        self.entry = entry
-        self.api_key = api_key
-        self.model = model
-        self.ha_tools = ha_tools  # Store the instance
-        self.base_prompt = prompt or DEFAULT_PROMPT
+        try:
+            self.hass = hass
+            self.entry = entry
+            self.api_key = api_key
+            self.model = model
+            self.ha_tools = ha_tools  # Store the instance
+            self.base_prompt = prompt or DEFAULT_PROMPT
 
-        # Get tool schemas from the passed instance
-        self.tools: Sequence[chat_pb2.Tool] = self.ha_tools.get_tool_schemas()
+            # Get tool schemas from the passed instance
+            self.tools: Sequence[chat_pb2.Tool] = self.ha_tools.get_tool_schemas()
+            _LOGGER.debug("Loaded %d tool schemas successfully", len(self.tools))
+        except Exception as e:
+            _LOGGER.error(
+                "Failed to initialize tools in GrokConversationAgent: %s",
+                e,
+                exc_info=True,
+            )
+            raise HomeAssistantError(f"Tool initialization error: {str(e)}")
 
         self.client = AsyncClient(api_key=self.api_key)
         self.conversations: Dict[str, ConversationContext] = {}
@@ -110,7 +124,14 @@ class GrokConversationAgent(AbstractConversationAgent):  # type: ignore
         return ["en"]
 
     async def async_process(self, user_input: ConversationInput) -> ConversationResult:
-        """Process user input with tool-calling loop."""
+        """Process user input with tool-calling loop.
+
+        Args:
+            user_input: Conversation input from HA.
+
+        Returns:
+            ConversationResult with response.
+        """
         conversation_id = user_input.conversation_id or str(uuid.uuid4())
         _LOGGER.debug(
             "Processing input for conversation_id: %s, text: %s",
@@ -146,6 +167,9 @@ class GrokConversationAgent(AbstractConversationAgent):  # type: ignore
                 # --- THIS IS THE MODIFIED LINE ---
                 # Call the method from the ha_tools instance instead
                 ha_context_summary = await self.ha_tools.async_get_ha_context_summary()
+                _LOGGER.debug(
+                    "Fetched HA context summary for conversation %s", conversation_id
+                )
                 # --- END MODIFICATION ---
 
                 chat = self.client.chat.create(
@@ -208,18 +232,25 @@ class GrokConversationAgent(AbstractConversationAgent):  # type: ignore
                 tool_name = tool_call.function.name
                 try:
                     params_str = tool_call.function.arguments
-                    _LOGGER.debug("Tool call: %s, Args: %s", tool_name, params_str)
+                    _LOGGER.debug(
+                        "Executing tool: %s with args: %s", tool_name, params_str
+                    )
                     params = json.loads(params_str)
-
                     method = getattr(self.ha_tools, tool_name, None)
                     if not callable(method):
                         raise ValueError(f"Unknown tool: {tool_name}")
-
                     result = await method(**params)
                     tool_results.append(tool_result(json.dumps(result)))
-
-                except (json.JSONDecodeError, ValueError) as e:
-                    error_msg = f"Tool {tool_name} invalid args/unknown: {str(e)}"
+                except json.JSONDecodeError as e:
+                    error_msg = f"Invalid JSON in tool args for {tool_name}: {str(e)}"
+                    _LOGGER.error(error_msg)
+                    tool_results.append(
+                        tool_result(
+                            json.dumps({"status": "error", "message": error_msg})
+                        )
+                    )
+                except ValueError as e:
+                    error_msg = f"Tool validation error for {tool_name}: {str(e)}"
                     _LOGGER.error(error_msg)
                     tool_results.append(
                         tool_result(
@@ -227,7 +258,7 @@ class GrokConversationAgent(AbstractConversationAgent):  # type: ignore
                         )
                     )
                 except Exception as e:
-                    error_msg = f"Tool {tool_name} execution failed: {str(e)}"
+                    error_msg = f"Tool execution failed for {tool_name}: {str(e)}"
                     _LOGGER.error(error_msg, exc_info=True)
                     tool_results.append(
                         tool_result(
@@ -273,42 +304,47 @@ class GrokConversationAgent(AbstractConversationAgent):  # type: ignore
         return ConversationResult(response=intent_response)
 
     async def _async_sample_with_retries(self, chat: Chat) -> Response:
-        """Helper to sample chat with retries and timeout."""
+        """Sample chat with retries and timeout.
+
+        Args:
+            chat: xAI Chat instance.
+
+        Returns:
+            Response from API.
+
+        Raises:
+            HomeAssistantError on failure after retries.
+        """
         async with self.rate_limiter:
             last_exception: Exception = Exception("Unknown error")
             for attempt in range(MAX_RETRIES):
                 try:
-                    _LOGGER.debug("Sampling chat (Attempt %d)...", attempt + 1)
+                    _LOGGER.debug("API sample attempt %d for chat", attempt + 1)
                     return await asyncio.wait_for(
                         chat.sample(), timeout=DEFAULT_API_TIMEOUT
                     )
                 except asyncio.TimeoutError as e:
-                    _LOGGER.warning("API timeout (Attempt %d)", attempt + 1)
+                    _LOGGER.warning("API timeout on attempt %d", attempt + 1)
                     last_exception = e
                     if attempt == MAX_RETRIES - 1:
-                        raise HomeAssistantError("API timeout after retries")
-                    await asyncio.sleep(2**attempt)  # Exponential backoff
-                except grpc.RpcError as grpc_err:
+                        raise HomeAssistantError("API timeout after max retries")
+                    await asyncio.sleep(
+                        2**attempt + random.uniform(0, 1)
+                    )  # Jittered backoff
+                except grpc.RpcError as e:
                     _LOGGER.error(
-                        "gRPC error on sample (Attempt %d): %s", attempt + 1, grpc_err
+                        "gRPC error on attempt %d: %s", attempt + 1, e.details()
                     )
-                    last_exception = grpc_err
+                    last_exception = e
                     if attempt == MAX_RETRIES - 1:
-                        raise HomeAssistantError(f"gRPC failed: {grpc_err.details()}")
-                    await asyncio.sleep(2**attempt)
+                        raise HomeAssistantError(f"gRPC error: {e.details()}")
+                    await asyncio.sleep(2**attempt + random.uniform(0, 1))
                 except Exception as e:
                     _LOGGER.error(
-                        "API sample error (Attempt %d): %s",
-                        attempt + 1,
-                        str(e),
-                        exc_info=True,
+                        "API error on attempt %d: %s", attempt + 1, e, exc_info=True
                     )
                     last_exception = e
                     if attempt == MAX_RETRIES - 1:
-                        raise HomeAssistantError(f"API failed: {str(e)}")
-                    await asyncio.sleep(2**attempt)
-
-        # This line should not be reachable, but raises for type safety
-        raise HomeAssistantError(
-            f"Unexpected failure in sample retries: {last_exception}"
-        )
+                        raise HomeAssistantError(f"API failure: {str(e)}")
+                    await asyncio.sleep(2**attempt + random.uniform(0, 1))
+            raise HomeAssistantError(f"Unexpected retry failure: {last_exception}")

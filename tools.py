@@ -1,16 +1,16 @@
-"""Grok-Homeassistant tool module. This file covers all of the tools that Grok
-can call on the Homeassistant platform integration."""
+"""Grok-Homeassistant tool module.
 
-import asyncio
+This module defines tools that Grok can call within the Home Assistant integration.
+Tools follow xAI SDK schema (chat_pb2.Tool) and return JSON-serializable dicts.
+"""
+
 import fnmatch
 import inspect
 import json
 import logging
-import re
 import typing
 from dataclasses import dataclass, field
 from datetime import datetime
-from functools import lru_cache
 from typing import (
     Any,
     Dict,
@@ -24,8 +24,7 @@ from typing import (
 )
 
 from homeassistant.components.homeassistant.exposed_entities import async_should_expose
-from homeassistant.core import State  # Import State for type checking
-from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, State
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
@@ -34,17 +33,12 @@ from homeassistant.helpers import floor_registry as fr
 from homeassistant.helpers import label_registry as lr
 from homeassistant.helpers import llm
 from homeassistant.helpers.event import async_call_later
-from xai_sdk.chat import tool as xai_tool
-
-# removed: from xai_sdk.chat import tool_result (This was causing Bug #2)
-from xai_sdk.proto import chat_pb2  # For Tool proto only
+from xai_sdk.proto import chat_pb2  # Only for Tool proto; no 'tool' import
 
 from .const import MAX_SEARCH_RESULTS
 
 _LOGGER = logging.getLogger(__name__)
 
-# Note: This is a prompt instruction, not a tool definition.
-# It's better placed in const.py or conversation.py as part of the system prompt.
 TOOL_INSTRUCTIONS = ["'call_ha_service' with parameters: domain, service, target, data"]
 
 JSON_TYPE_MAPPING = {
@@ -66,57 +60,58 @@ TYPE_MAPPING = {
     list: "array",
     tuple: "array",
     dict: "object",
-    Any: "object",  # Fallback for Any
+    Any: "object",
 }
 
 
 def parse_docstring_descriptions(doc: str) -> Dict[str, str]:
-    """Parse param descriptions from docstring (PEP 257 style).
+    """Parse parameter descriptions from docstring (PEP 257 style).
 
     Args:
         doc: The docstring to parse.
 
     Returns:
-        Dict of param names to descriptions.
+        Dictionary of parameter names to descriptions.
     """
     descriptions = {}
     if doc:
         lines = doc.splitlines()
         current_param = None
         for line in lines:
-            if line.strip().startswith(":param"):
+            line = line.strip()
+            if line.startswith(":param"):
                 parts = line.split(":", 2)
                 if len(parts) > 2:
                     param_name = parts[1].strip().split()[0]
                     desc = parts[2].strip()
                     descriptions[param_name] = desc
                     current_param = param_name
-            elif current_param and line.strip():
-                descriptions[current_param] += " " + line.strip()
+            elif current_param and line:
+                descriptions[current_param] += " " + line
     return descriptions
 
 
 def type_to_schema(
     ann: Type[Any],
-    descriptions: Dict[str, str] | None = None,
-    param_name: str | None = None,
+    descriptions: Optional[Dict[str, str]] = None,
+    param_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Recursively convert type annotation to JSON Schema dict.
 
     Args:
         ann: Type annotation to convert.
-        descriptions: Param descriptions from docstring.
+        descriptions: Parameter descriptions from docstring.
         param_name: Name of the parameter for description lookup.
 
     Returns:
-        JSON Schema dict.
+        JSON Schema dictionary.
     """
     origin = get_origin(ann)
     args = get_args(ann)
     schema: Dict[str, Any] = {}
     if origin is Union:
         non_none_args = [a for a in args if a is not type(None)]
-        if len(args) > len(non_none_args):  # Has None, make nullable
+        if len(args) > len(non_none_args):
             if len(non_none_args) == 1:
                 sub_schema = type_to_schema(non_none_args[0], descriptions, param_name)
                 schema["anyOf"] = [sub_schema, {"type": "null"}]
@@ -127,7 +122,6 @@ def type_to_schema(
                 schemas.append({"type": "null"})
                 schema["anyOf"] = schemas
         else:
-            # Union without null
             schema["anyOf"] = [
                 type_to_schema(a, descriptions, param_name) for a in args
             ]
@@ -158,7 +152,14 @@ def type_to_schema(
 def make_json_serializable(
     obj: Any,
 ) -> Union[Dict[str, Any], List[Any], str, int, float, bool, None]:
-    """Recursively convert an object to be JSON serializable."""
+    """Recursively convert an object to be JSON serializable.
+
+    Args:
+        obj: Object to serialize.
+
+    Returns:
+        JSON-serializable object.
+    """
     if isinstance(obj, dict):
         return {k: make_json_serializable(v) for k, v in obj.items()}
     elif isinstance(obj, list):
@@ -169,20 +170,16 @@ def make_json_serializable(
         return list(obj)
     elif isinstance(obj, datetime):
         return obj.isoformat()
-    elif isinstance(obj, State):  # <-- Explicitly handle State objects
-        _LOGGER.warning(
-            "make_json_serializable called on raw State object. "
-            "This should be avoided. Use .as_dict() first."
-        )
+    elif isinstance(obj, State):
         return make_json_serializable(obj.as_dict())
     elif isinstance(obj, (str, int, float, bool, type(None))):
         return obj
     else:
-        # Fallback for other non-serializable types
         try:
             return str(obj)
-        except Exception:
-            return "Unserializable Object"
+        except Exception as e:
+            _LOGGER.debug("Failed to serialize object: %s", e)
+            return None
 
 
 @dataclass
@@ -193,13 +190,19 @@ class ToolSchema:
 
 
 class GrokHaTool:
-    """Class for managing HA tools and registries.
+    """Manages Home Assistant tools, registries, and context summaries.
 
-    An instance of this class is created once on integration setup.
+    This class follows single-responsibility: Handles tool schemas,
+    executions, and HA queries.
+    Instance created once on setup for sharing across conversations.
     """
 
     def __init__(self, hass: HomeAssistant) -> None:
-        """Initialize the GrokHaTool instance."""
+        """Initialize the GrokHaTool instance.
+
+        Args:
+            hass: Home Assistant core instance.
+        """
         _LOGGER.debug("Initializing GrokHaTool")
         self.hass = hass
         self.ent_reg = er.async_get(hass)
@@ -207,11 +210,12 @@ class GrokHaTool:
         self.floor_reg = fr.async_get(hass)
         self.label_reg = lr.async_get(hass)
         self.dev_reg = dr.async_get(hass)
-
         self._exposed_entities: Optional[List[Dict[str, Any]]] = None
         self._debounce_call: Optional[CALLBACK_TYPE] = None
+        # Cache for optimization
+        self._ha_context_summary_cache: Optional[str] = None
 
-        # Store listeners as instance attributes
+        # Setup listeners
         self._registry_remove = self.hass.bus.async_listen(
             "entity_registry_updated", self._async_invalidate_cache
         )
@@ -220,14 +224,21 @@ class GrokHaTool:
         )
 
     async def _async_invalidate_cache(self, event: Event) -> None:
-        """Invalidate exposed entities cache on registry update."""
+        """Invalidate caches on registry/state updates.
+
+        Args:
+            event: HA event triggering invalidation.
+        """
         self._exposed_entities = None
-        _LOGGER.debug(
-            "Exposed entities cache invalidated by event: %s", event.event_type
-        )
+        self._ha_context_summary_cache = None
+        _LOGGER.debug("Caches invalidated by event: %s", event.event_type)
 
     async def _async_debounced_invalidate_cache(self, event: Event) -> None:
-        """Debounced cache invalidation on state changes."""
+        """Debounced cache invalidation for state changes.
+
+        Args:
+            event: HA event.
+        """
         if self._debounce_call:
             self._debounce_call()
 
@@ -237,7 +248,7 @@ class GrokHaTool:
         self._debounce_call = async_call_later(self.hass, 30, _delayed_invalidate)
 
     def async_unload_listeners(self) -> None:
-        """Unload event listeners and reset cache."""
+        """Unload event listeners and clear caches."""
         if self._registry_remove:
             self._registry_remove()
             self._registry_remove = None
@@ -246,126 +257,95 @@ class GrokHaTool:
             self._state_remove = None
         if self._debounce_call:
             self._debounce_call()
-            self._debounce_call = None
-
         self._exposed_entities = None
-        self.get_tool_schemas.cache_clear()  # Clear LRU cache
-        _LOGGER.debug("Unloaded GrokHaTool listeners and reset cache")
+        self._ha_context_summary_cache = None
+        _LOGGER.debug("GrokHaTool listeners unloaded")
 
-    @classmethod
-    @lru_cache(maxsize=1)
-    def get_tool_schemas(cls) -> Sequence[chat_pb2.Tool]:
-        """Generate xAI tool schemas from class methods."""
-        schemas = []
-        for name, method in inspect.getmembers(cls, inspect.isfunction):
-            # *** FIX #3: Added 'async_get_ha_context_summary' to exclusion list ***
-            if name.startswith("_") or name in (
-                "get_tool_schemas",
-                "__init__",
-                "async_unload_listeners",
-                "get_area_name",
-                "async_get_ha_context_summary",  # This is not for the LLM
-            ):
-                continue
-            if not asyncio.iscoroutinefunction(method):
-                continue
-            sig = inspect.signature(method)
+    def get_tool_schemas(self) -> Sequence[chat_pb2.Tool]:
+        """Generate xAI-compatible tool schemas from public async methods.
+
+        Auto-detects tools as non-private async methods;
+        generates schemas from annotations/docstrings.
+
+        Returns:
+            List of chat_pb2.Tool protos.
+        """
+        tools = []
+        for name, method in inspect.getmembers(self, inspect.ismethod):
+            if name.startswith("_") or not inspect.iscoroutinefunction(method):
+                continue  # Skip private or sync methods
             doc = inspect.getdoc(method) or ""
-            if not doc:
-                _LOGGER.warning("Tool method %s has no docstring, skipping.", name)
-                continue
-
-            description = doc.splitlines()[0].strip()
-            param_descs = parse_docstring_descriptions(doc)
-            properties = {}
-            required = []
-            for param_name, param in sig.parameters.items():
-                if param_name == "self":
-                    continue
-                ann = param.annotation
-                if ann is inspect.Parameter.empty:
-                    _LOGGER.warning(
-                        "Tool %s parameter %s has no type annotation, skipping.",
-                        name,
-                        param_name,
-                    )
-                    continue
-                schema = type_to_schema(ann, param_descs, param_name)
-                properties[param_name] = schema
-                if param.default is inspect.Parameter.empty:
-                    required.append(param_name)
-            parameters_dict = {
-                "type": "object",
-                "properties": properties,
-                "required": required,
+            descriptions = parse_docstring_descriptions(doc)
+            params = inspect.signature(method).parameters
+            param_schemas = {
+                p.name: type_to_schema(p.annotation, descriptions, p.name)
+                for p in params.values()
+                if p.name != "self"
             }
-            try:
-                schemas.append(xai_tool(name, description, parameters_dict))
-                _LOGGER.debug(f"Added tool schema for {name}")
-            except Exception as e:
-                _LOGGER.error(f"Failed to create tool schema for {name}: {e}")
-        return schemas
+            schema = {
+                "type": "object",
+                "properties": param_schemas,
+                "required": [
+                    p.name
+                    for p in params.values()
+                    if p.default == inspect.Parameter.empty and p.name != "self"
+                ],
+            }
+            tool_desc = doc.splitlines()[0] if doc else f"Tool: {name}"
+            tools.append(
+                chat_pb2.Tool(
+                    function=chat_pb2.Function(
+                        name=name,
+                        description=tool_desc,
+                        parameters=json.dumps(schema),
+                    )
+                )
+            )
+            _LOGGER.debug("Generated tool schema for: %s", name)
+        if not tools:
+            _LOGGER.warning("No tool schemas generated; check for public async methods")
+        return tools
 
     async def async_get_ha_context_summary(self) -> str:
-        """Generate a summary of the Home Assistant configuration for the LLM."""
+        """Generate a summary of HA configuration for Grok context.
+
+        Includes floors, areas, domains, etc. Cached for performance.
+
+        Returns:
+            Formatted string summary.
+        """
+        if self._ha_context_summary_cache:
+            _LOGGER.debug("Returning cached HA context summary")
+            return self._ha_context_summary_cache
+
         try:
-            # Use the class's existing registry instances
-            floors = {f.floor_id: f.name for f in self.floor_reg.async_list_floors()}
+            floors = self.floor_reg.async_list_floors()
             areas = self.area_reg.async_list_areas()
+            entities = list(
+                self.ent_reg.entities.values()
+            )  # Optimized: values() for efficiency
+            domains = {entry.domain for entry in entities if entry.domain}
 
-            # Get all entity domains
-            domains = sorted(
-                list(set(entry.domain for entry in self.ent_reg.entities.values()))
+            summary = "Home Assistant Context:\n"
+            summary += (
+                f"- Floors: {', '.join(f.name for f in floors if f.name) or 'None'}\n"
             )
+            for floor in floors:
+                floor_areas = [a for a in areas if a.floor_id == floor.floor_id]
+                summary += (
+                    f"  - {floor.name or 'Unnamed'}: "
+                    f"Areas - {', '.join(a.name for a in floor_areas
+                                         if a.name) or 'None'}\n"
+                )
+            summary += f"- Domains: {', '.join(sorted(domains)) or 'None'}\n"
+            summary += "- Use tools like find_entities_advanced for detailed queries.\n"
 
-            summary_lines = ["Home Assistant Configuration Summary:"]
-
-            # 1. Floors and Areas
-            if floors or areas:
-                summary_lines.append("\nFloors and Areas:")
-                floor_areas: dict[int, list[Any]] = {fid: [] for fid in floors}
-                unassigned_areas = []
-
-                for area in areas:
-                    if area.floor_id in floor_areas:
-                        floor_areas[area.floor_id].append(area.name)
-                    else:
-                        unassigned_areas.append(area.name)
-
-                for floor_id, floor_name in floors.items():
-                    area_list = ", ".join(sorted(floor_areas[floor_id])) or "No areas"
-                    summary_lines.append(f"- Floor '{floor_name}': [{area_list}]")
-
-                if unassigned_areas:
-                    summary_lines.append(
-                        "- Areas with no floor: "
-                        f"[{', '.join(sorted(unassigned_areas))}]"
-                    )
-            else:
-                summary_lines.append("\nNo Floors or Areas are configured.")
-
-            # 2. Available Domains
-            if domains:
-                summary_lines.append("\nAvailable Device Domains:")
-                summary_lines.append(f"[{', '.join(domains)}]")
-            else:
-                summary_lines.append("\nNo device domains found.")
-
-            summary = "\n".join(summary_lines)
-            _LOGGER.debug("Generated HA context summary: %s", summary)
+            self._ha_context_summary_cache = summary
+            _LOGGER.info("Generated HA context summary")
             return summary
         except Exception as e:
             _LOGGER.error("Failed to generate HA context summary: %s", e)
-            return "Could not retrieve HA context."
-
-    def get_area_name(self, entry: er.RegistryEntry) -> str:
-        """Get area name from an entity registry entry."""
-        if not entry or not entry.area_id:
-            return ""
-        area_entry = self.area_reg.async_get_area(entry.area_id)
-        if not area_entry:
-            return ""
-        return area_entry.name or ""
+            raise HomeAssistantError(f"Context summary error: {str(e)}")
 
     async def call_ha_service(
         self,
@@ -376,441 +356,291 @@ class GrokHaTool:
     ) -> Dict[str, Any]:
         """Call a Home Assistant service.
 
-        :param domain: The domain of the service (e.g., 'light').
-        :param service: The service to call (e.g., 'turn_on').
-        :param target: Optional target entities (e.g.,
-                       {'entity_id': 'light.living_room'}).
-        :param data: Optional service data (e.g., {'brightness_pct': 50}).
+        Args:
+            domain: Service domain (e.g., 'light').
+            service: Service name (e.g., 'turn_on').
+            target: Target entity/area/device
+                    (JSON dict, e.g., {'entity_id': 'light.bedroom'}).
+            data: Service data (JSON dict, e.g., {'brightness_pct': 50}).
+
+        Returns:
+            Dict with status and message.
         """
         try:
-            await self.hass.services.async_call(domain, service, target, data)
-            return {"status": "success"}
+            _LOGGER.debug(
+                "Calling service: %s.%s with target=%s, data=%s",
+                domain,
+                service,
+                target,
+                data,
+            )
+            await self.hass.services.async_call(
+                domain, service, target=target, service_data=data
+            )
+            return {"status": "success", "message": f"Called {domain}.{service}"}
         except Exception as e:
+            _LOGGER.error("Service call failed: %s", e)
             return {"status": "error", "message": str(e)}
 
-    async def get_exposed_entities(self) -> List[Dict[str, Any]]:
-        """Get list of exposed entities with details like name, aliases, entity_id."""
-        if self._exposed_entities is None:
-            try:
-                _LOGGER.debug("Fetching fresh exposed entities (cache miss)")
-                apis = llm.async_get_apis(self.hass)
-
-                # Use DOMAIN from const.py for robust assistant_id matching
-                assistant_id = typing.cast(
-                    str,
-                    next(
-                        (api.id for api in apis if api.id == "grok_xai_conversation"),
-                        "conversation",  # Fallback
-                    ),
-                )
-
-                device_id_to_name = {
-                    entry.id: entry.name or ""
-                    for entry in self.dev_reg.devices.values()
-                }  # Coalesce None to ""
-                exposed = []
-                for ent in self.ent_reg.entities.values():
-                    if async_should_expose(self.hass, assistant_id, ent.entity_id):
-                        exposed.append(
-                            {
-                                "entity_id": ent.entity_id,
-                                "name": ent.name or ent.original_name or ent.entity_id,
-                                "aliases": ent.aliases,
-                                "domain": ent.domain,
-                                "area_name": self.get_area_name(ent) or "",
-                                "device_name": (
-                                    device_id_to_name.get(ent.device_id, "")
-                                    if ent.device_id
-                                    else ""
-                                ),
-                            }
-                        )
-                self._exposed_entities = exposed
-            except Exception as e:
-                _LOGGER.error(f"Failed to fetch exposed entities: {e}")
-                raise HomeAssistantError(str(e))
-        else:
-            _LOGGER.debug("Using cached exposed entities")
-        return self._exposed_entities
-
-    async def find_entities_advanced(
+    async def async_search_entities(
         self,
         name: Optional[str] = None,
-        simple_mode: bool = False,
-        filters: Optional[Dict[str, Any]] = None,
-        limit: int = MAX_SEARCH_RESULTS,
-        offset: int = 0,
         entity_globs: Optional[Union[str, List[str]]] = None,
         domains: Optional[Union[str, List[str]]] = None,
         area_globs: Optional[Union[str, List[str]]] = None,
         floor_globs: Optional[Union[str, List[str]]] = None,
         tag_globs: Optional[Union[str, List[str]]] = None,
         device_globs: Optional[Union[str, List[str]]] = None,
+        filters: Optional[Union[str, Dict[str, Any]]] = None,
+        limit: int = MAX_SEARCH_RESULTS,
+        offset: int = 0,
+        simple_mode: bool = False,
     ) -> Union[List[Dict[str, Any]], str]:
-        """Advanced entity search with glob patterns and filters.
-           Use simple_mode for name-based fuzzy search.
+        """Search for exposed entities with filters.
 
-        Note: Always fetches fresh states for accuracy;
-              static entity info may be cached.
+        Args:
+            name: Simple name search (simple_mode only).
+            entity_globs: Glob patterns for entity IDs.
+            domains: Domain(s) to match (e.g., 'light').
+            area_globs: Glob patterns for areas.
+            floor_globs: Glob patterns for floors.
+            tag_globs: Glob patterns for labels.
+            device_globs: Glob patterns for devices.
+            filters: Dict with 'domain' or 'attributes'.
+            limit: Max results (default 10).
+            offset: Result offset.
+            simple_mode: Basic name-based search.
 
-        :param name: The name to search for in simple mode.
-        :param simple_mode: If true, use fuzzy name search; else advanced globs.
-        :param filters: Additional filters (e.g.,
-                       domain, attributes like {'device_class': 'temperature'}).
-        :param limit: Max results (default 10).
-        :param offset: Result offset.
-        :param entity_globs: Glob patterns for entity IDs.
-        :param domains: Domains to filter (e.g., 'sensor' or ['light', 'switch']).
-        :param area_globs: Glob patterns for areas.
-        :param floor_globs: Glob patterns for floors.
-        :param tag_globs: Glob patterns for tags.
-        :param device_globs: Glob patterns for devices.
-        :example filters: JSON object, e.g., {'domain': 'light',
-                         'attributes': {'device_class': 'temperature'}}.
+        Returns:
+            List of matching entity dicts or error message.
         """
-        _LOGGER.debug(
-            "find_entities_advanced called with: name=%s, simple_mode=%s, "
-            "filters=%s, entity_globs=%s, domains=%s, area_globs=%s, "
-            "floor_globs=%s, tag_globs=%s, device_globs=%s",
-            name,
-            simple_mode,
-            filters,
-            entity_globs,
-            domains,
-            area_globs,
-            floor_globs,
-            tag_globs,
-            device_globs,
-        )
         try:
-            if isinstance(filters, str):
-                filters = json.loads(filters)
-        except json.JSONDecodeError:
-            _LOGGER.warning(
-                "Invalid filters JSON in find_entities_advanced; using empty dict"
-            )
-            filters = {}
-        except Exception as e:
-            _LOGGER.error(f"Filter processing error in find_entities_advanced: {e}")
-            return f"Invalid filters provided: {e}"
-        filters = filters or {}  # Default to empty dict to avoid NoneType errors
+            exposed = await self.get_exposed_entities()
+        except HomeAssistantError as e:
+            _LOGGER.error("Error fetching exposed entities: %s", e)
+            return f"Error: {str(e)}"
 
-        # *** MODIFIED ensure_list function ***
+        if isinstance(filters, str):
+            try:
+                filters = json.loads(filters)
+                _LOGGER.debug("Successfully parsed filters from string to dict")
+            except json.JSONDecodeError as e:
+                _LOGGER.warning("Invalid filters JSON: %s", e)
+                return f"Invalid filters: {str(e)}"
+
+        # Type narrowing: After parsing, filters is either None or dict
+        if filters is not None and not isinstance(filters, dict):
+            _LOGGER.error("Unexpected parsed filters type: %s", type(filters))
+            return "Error: Invalid filters type"
+
         def ensure_list(value: Optional[Union[str, List[str]]]) -> List[str]:
-            """Ensure value is a list, parsing JSON strings if needed."""
             if value is None:
                 return []
-            if isinstance(value, list):
-                return value
             if isinstance(value, str):
-                stripped_value = value.strip()
-                # Check if it looks like a JSON list
-                if stripped_value.startswith("[") and stripped_value.endswith("]"):
-                    try:
-                        parsed = json.loads(stripped_value)
-                        if isinstance(parsed, list):
-                            _LOGGER.debug("Parsed JSON string to list: %s", parsed)
-                            return parsed
-                    except json.JSONDecodeError:
-                        # It wasn't valid JSON, fall back to treating it
-                        # as a single string
-                        _LOGGER.debug(
-                            "String looked like list but failed to parse: %s", value
-                        )
-                        pass
-                # Not a JSON list or failed to parse, treat as a single-item list
-                return [value]
-            # Fallback for other non-list, non-str types
-            return [str(value)]
+                return [value.strip()]
+            return value
 
-        def glob_match(string: str, pattern: str) -> bool:
-            """Case-insensitive glob matching."""
-            try:
-                # fnmatch.translate converts glob to regex
-                regex_pattern = fnmatch.translate(pattern)
-                regex = re.compile(regex_pattern, re.IGNORECASE)
-                return regex.match(string) is not None
-            except re.error as e:
-                _LOGGER.warning(
-                    "Invalid glob pattern '%s' (regex error: %s)", pattern, e
-                )
-                return False
-
-        # --- Simple Mode Logic ---
-        if simple_mode:
-            if not name:
-                _LOGGER.warning("Simple mode search called without 'name'")
-                return [{"message": "Name required for simple search"}]
-            words = name.lower().split()
-            domain_filter = filters.get("domain")
-            if not domain_filter and domains:
-                # Use first domain if provided
-                domain_list = ensure_list(domains)
-                if domain_list:
-                    domain_filter = domain_list[0]
-
-            attr_filters = filters.get("attributes", {})
-            matching_entity_ids = set()
-            try:
-                exposed = await self.get_exposed_entities()
-            except HomeAssistantError as e:
-                return f"Error getting entities: {e}"
-
-            area_globs_list = ensure_list(area_globs)
-            device_globs_list = ensure_list(device_globs)
-
-            for ent in exposed:
-                if domain_filter and ent["domain"] != domain_filter:
-                    continue
-
-                try:
-                    # Apply area/device globs even in simple mode
-                    if area_globs_list and not any(
-                        glob_match(ent["area_name"], g) for g in area_globs_list
-                    ):
-                        continue
-                    if device_globs_list and not any(
-                        glob_match(ent["device_name"], g) for g in device_globs_list
-                    ):
-                        continue
-                except TypeError as te:
-                    _LOGGER.error(f"TypeError in simple_mode glob matching: {te}")
-                    continue
-
-                # Score based on name, entity_id, area, and aliases
-                score = sum(
-                    1
-                    for word in words
-                    if word in ent["name"].lower()
-                    or word in ent["entity_id"].lower()
-                    or word in ent["area_name"].lower()
-                    or any(word in alias.lower() for alias in ent.get("aliases", []))
-                )
-                if score > 0:
-                    matching_entity_ids.add(ent["entity_id"])
-
-            # Fetch fresh states for matching IDs
-            matching = []
-            for entity_id in sorted(list(matching_entity_ids)):
-                fresh_state = self.hass.states.get(entity_id)
-                if not fresh_state:
-                    continue
-
-                # Apply attribute filters on fresh state
-                if attr_filters:
-                    attrs = fresh_state.attributes
-                    if not all(attrs.get(k) == v for k, v in attr_filters.items()):
-                        _LOGGER.debug(
-                            "Skipping %s, attr_filter mismatch. Wanted: %s, Got: %s",
-                            entity_id,
-                            attr_filters,
-                            attrs,
-                        )
-                        continue
-
-                ent_info = next(
-                    (e for e in exposed if e["entity_id"] == entity_id), None
-                )
-                if ent_info:
-                    matching.append(
-                        {
-                            "entity_id": entity_id,
-                            "name": ent_info["name"],
-                            "area_name": ent_info["area_name"],
-                            "state": fresh_state.state,
-                            "unit": fresh_state.attributes.get("unit_of_measurement"),
-                            # Add all attributes for better context
-                            "attributes": make_json_serializable(
-                                fresh_state.attributes
-                            ),
-                        }
-                    )
-
-            _LOGGER.debug(f"Simple mode matched {len(matching)} entities")
-            return (
-                matching[offset : offset + limit]
-                if matching
-                else [{"message": "No entities found matching criteria"}]
-            )
-
-        # --- Advanced Mode Logic ---
+        domains_list = ensure_list(domains) or ensure_list(
+            filters.get("domain") if filters else None
+        )
         entity_globs_list = ensure_list(entity_globs)
-        domains_list = ensure_list(domains)
         area_globs_list = ensure_list(area_globs)
         floor_globs_list = ensure_list(floor_globs)
         tag_globs_list = ensure_list(tag_globs)
         device_globs_list = ensure_list(device_globs)
+        attr_filters = filters.get("attributes", {}) if filters else {}
 
-        # Merge filters.domain if no domains
-        if not domains_list and filters.get("domain"):
-            domains_list = ensure_list(filters.get("domain"))
-
-        # Pre-computation maps for faster lookups
+        # Cached maps
         floor_id_to_name = {
             entry.floor_id: entry.name or ""
             for entry in self.floor_reg.async_list_floors()
         }
-        area_id_to_name = {
-            entry.id: entry.name or "" for entry in self.area_reg.async_list_areas()
-        }
+
         label_id_to_name = {
             entry.label_id: entry.name or ""
             for entry in self.label_reg.async_list_labels()
         }
-        device_id_to_name = {
-            entry.id: entry.name or "" for entry in self.dev_reg.devices.values()
-        }
 
-        all_entity_entries = self.ent_reg.entities.values()
-        matching_entity_ids = set()
-        attr_filters = filters.get("attributes", {})
+        matching = []
+        for exp in exposed:
+            entity_id = exp["entity_id"]
+            entry = self.ent_reg.async_get(entity_id)
+            if not entry:
+                continue
 
-        for entry in all_entity_entries:
-            # Domain filter
             if domains_list and entry.domain not in domains_list:
                 continue
 
-            # Attribute filters (requires state)
-            if attr_filters:
-                state = self.hass.states.get(entry.entity_id)
-                if not state or not all(
-                    state.attributes.get(k) == v for k, v in attr_filters.items()
-                ):
-                    continue
-
-            # Entity ID glob
-            if entity_globs_list and not any(
-                glob_match(entry.entity_id, g) for g in entity_globs_list
+            state = self.hass.states.get(entity_id)
+            if not state:
+                continue
+            if attr_filters and not all(
+                state.attributes.get(k) == v for k, v in attr_filters.items()
             ):
                 continue
 
-            # Device glob
-            match_device = not device_globs_list
-            if device_globs_list and entry.device_id:
-                device_name = device_id_to_name.get(entry.device_id, "")
-                if device_name and any(
-                    glob_match(device_name, g) for g in device_globs_list
+            if simple_mode:
+                if not name:
+                    return [{"message": "Name required for simple search"}]
+                words = name.lower().split()
+                score = sum(
+                    1
+                    for word in words
+                    if word in exp["name"].lower()
+                    or word in entity_id.lower()
+                    or word in exp["area_name"].lower()
+                )
+                if score == 0:
+                    continue
+            else:
+                if entity_globs_list and not any(
+                    fnmatch.fnmatch(entity_id, g) for g in entity_globs_list
                 ):
-                    match_device = True
-            if not match_device:
-                continue
-
-            # Area glob
-            area_id = entry.area_id
-            device = None
-            if not area_id and entry.device_id:
-                device = self.dev_reg.async_get(entry.device_id)
-                if device:
-                    area_id = device.area_id
-
-            area_name = area_id_to_name.get(area_id, "") if area_id else ""
-            match_area = not area_globs_list
-            if area_globs_list:
-                if area_name and any(glob_match(area_name, g) for g in area_globs_list):
-                    _LOGGER.debug(
-                        "Entity %s matched area '%s' via glob",
-                        entry.entity_id,
-                        area_name,
+                    continue
+                if device_globs_list and not any(
+                    fnmatch.fnmatch(exp["device_name"], g) for g in device_globs_list
+                ):
+                    continue
+                if area_globs_list and not any(
+                    fnmatch.fnmatch(exp["area_name"], g) for g in area_globs_list
+                ):
+                    continue
+                area_id = (
+                    entry.area_id
+                    or (
+                        self.dev_reg.async_get(entry.device_id).area_id
+                        if entry.device_id
+                        else None
                     )
-                    match_area = True
-                else:
-                    _LOGGER.debug(
-                        "Entity %s skipped, area '%s' did not match globs: %s",
-                        entry.entity_id,
-                        area_name,
-                        area_globs_list,
-                    )
-            if not match_area:
-                continue
-
-            # Floor glob
-            match_floor = not floor_globs_list
-            if floor_globs_list:
+                    if entry.device_id
+                    else None
+                )
+                floor_name = ""
                 if area_id:
-                    area_entry = self.area_reg.async_get_area(area_id)
-                    if area_entry and area_entry.floor_id:
-                        floor_name = floor_id_to_name.get(area_entry.floor_id, "")
-                        if floor_name and any(
-                            glob_match(floor_name, g) for g in floor_globs_list
-                        ):
-                            match_floor = True
-            if not match_floor:
-                continue
-
-            # Tag/label glob
-            match_tag = not tag_globs_list
-            if tag_globs_list and entry.labels:
-                if any(
-                    glob_match(label_id_to_name.get(label_id, ""), g)
-                    for label_id in entry.labels
-                    for g in tag_globs_list
+                    area = self.area_reg.async_get_area(area_id)
+                    if area and area.floor_id:
+                        floor_name = floor_id_to_name.get(area.floor_id, "")
+                if floor_globs_list and not any(
+                    fnmatch.fnmatch(floor_name, g) for g in floor_globs_list
                 ):
-                    match_tag = True
-            if not match_tag:
-                continue
+                    continue
+                if (
+                    tag_globs_list
+                    and entry.labels
+                    and not any(
+                        fnmatch.fnmatch(label_id_to_name.get(lbl, ""), g)
+                        for lbl in entry.labels
+                        for g in tag_globs_list
+                    )
+                ):
+                    continue
 
-            # If all checks passed
-            matching_entity_ids.add(entry.entity_id)
+            matching.append(
+                {
+                    "entity_id": entity_id,
+                    "name": exp["name"],
+                    "area_name": exp["area_name"],
+                    "device_name": exp["device_name"],
+                    "state": state.state,
+                    "unit": state.attributes.get("unit_of_measurement"),
+                    "attributes": make_json_serializable(state.attributes),
+                }
+            )
 
-        _LOGGER.debug(f"Advanced mode matched {len(matching_entity_ids)} entities")
+        if not matching:
+            return "No matching entities found"
+        return matching[offset : offset + limit]
 
-        # Retrieve states only for matches
-        filtered_states = [
-            self.hass.states.get(entity_id)
-            for entity_id in sorted(list(matching_entity_ids))
-            if self.hass.states.get(entity_id)
-        ]
+    async def get_exposed_entities(self) -> List[Dict[str, Any]]:
+        """Fetch list of exposed entities with details (cached).
 
-        filtered_states = filtered_states[offset : offset + limit]
+        Returns:
+            List of entity dicts.
+        """
+        if self._exposed_entities is not None:
+            _LOGGER.debug("Returning cached exposed entities")
+            return self._exposed_entities
 
-        if not filtered_states:
-            return "No matches were found"
+        try:
+            # Use DOMAIN from const.py for robust assistant_id matching
+            apis = llm.async_get_apis(self.hass)
+            assistant_id = typing.cast(
+                str,
+                next(
+                    (api.id for api in apis if api.id == "grok_xai_conversation"),
+                    "conversation",  # Fallback
+                ),
+            )
 
-        # *** FIX #1: Convert State objects to serializable dicts ***
-        results = [
-            typing.cast(Dict[str, Any], make_json_serializable(state.as_dict()))
-            for state in filtered_states
-        ]
-
-        _LOGGER.debug("Returning %d serialized entities", len(results))
-        return results
+            exposed = []
+            for (
+                entry
+            ) in self.ent_reg.entities.values():  # Optimized: values() for all entities
+                if async_should_expose(self.hass, assistant_id, entry.entity_id):
+                    area_name = ""
+                    device_name = ""
+                    if entry.area_id:
+                        area = self.area_reg.async_get_area(entry.area_id)
+                        area_name = area.name if area else ""
+                    if entry.device_id:
+                        device = self.dev_reg.async_get(entry.device_id)
+                        device_name = device.name if device else ""
+                    exposed.append(
+                        {
+                            "entity_id": entry.entity_id,
+                            "name": entry.name or entry.original_name,
+                            "area_name": area_name,
+                            "device_name": device_name,
+                            "aliases": entry.aliases,
+                        }
+                    )
+            self._exposed_entities = exposed
+            _LOGGER.info("Fetched %d exposed entities", len(exposed))
+            return exposed
+        except Exception as e:
+            _LOGGER.error("Failed to fetch exposed entities: %s", e)
+            raise HomeAssistantError(str(e))
 
     async def get_entity_state(self, entity_id: str) -> Dict[str, Any]:
-        """Fetch the full state of an entity, including attributes and unit.
+        """Fetch full state of an entity.
 
-        :param entity_id: The entity ID to fetch.
-        :example entity_id: 'sensor.bedroom_temperature'.
+        Args:
+            entity_id: Entity ID (e.g., 'sensor.bedroom_temperature').
+
+        Returns:
+            Dict with state details or error message.
         """
         state = self.hass.states.get(entity_id)
         if not state:
+            _LOGGER.warning("Entity not found: %s", entity_id)
             return {"message": "Entity not found"}
+        # Cast to Dict[str, Any] since we know as_dict()
+        # produces a dict and serialization preserves it
         return typing.cast(Dict[str, Any], make_json_serializable(state.as_dict()))
 
-    # Example new tool: set_thermostat_temp (as suggested enhancement)
     async def set_thermostat_temp(
         self, entity_id: str, temperature: float
     ) -> Dict[str, Any]:
-        """Set the temperature of a thermostat entity.
+        """Set thermostat temperature.
 
-        :param entity_id: The entity ID of the thermostat.
-        :param temperature: The temperature to set.
-        :example entity_id: 'climate.living_room_thermostat'.
-        :example temperature: 72.5.
+        Args:
+            entity_id: Thermostat entity ID (e.g., 'climate.living_room').
+            temperature: Target temperature (e.g., 72.5).
+
+        Returns:
+            Dict with status and message.
         """
         try:
             await self.hass.services.async_call(
                 "climate",
                 "set_temperature",
-                target={"entity_id": entity_id},
-                data={"temperature": temperature},
+                {"entity_id": entity_id},
+                {"temperature": temperature},
             )
-
-            # *** FIX #2: Removed tool_result() wrapper. Return a simple dict. ***
             return {
                 "status": "success",
                 "message": f"Set {entity_id} to {temperature} degrees",
             }
-
         except Exception as e:
-            _LOGGER.error(f"Failed to set thermostat: {str(e)}")
+            _LOGGER.error("Failed to set thermostat: %s", e)
             return {"status": "error", "message": str(e)}
