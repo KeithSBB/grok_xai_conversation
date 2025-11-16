@@ -5,7 +5,7 @@ such as domain, default models, prompts, and API configurations.
 """
 
 # Integration domain identifier
-DOMAIN = "grok_xai_conversation"
+DOMAIN = "grokzilla"
 
 # Default xAI model (fallback for config)
 DEFAULT_MODEL = "grok-beta"
