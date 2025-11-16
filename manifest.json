@@ -1,13 +1,13 @@
 {
   "domain": "grok_xai_conversation",
   "name": "Grok xAI Conversation",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "issue_tracker": "https://github.com/KeithSBB/grok_xai_conversation/issues",
   "documentation": "https://x.ai/api",
   "requirements": ["xai-sdk==1.3.0"],
   "config_flow": true,
   "dependencies": ["conversation"],
-  "homeassistant": "2024.10.0",
+  "homeassistant": "2025.11.0",
   "codeowners": ["@KeithSBB"],
   "iot_class": "cloud_polling",
   "integration_type": "service"

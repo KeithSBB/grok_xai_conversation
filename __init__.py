@@ -22,7 +22,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     config = {**entry.data, **entry.options}
 
     # Create a single instance of GrokHaTool and store it
-    ha_tools = GrokHaTool(hass)
+    ha_tools = GrokHaTool(hass, entry)
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "ha_tools": ha_tools,

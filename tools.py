@@ -6,9 +6,7 @@ Tools follow xAI SDK schema (chat_pb2.Tool) and return JSON-serializable dicts.
 
 import fnmatch
 import inspect
-import json
 import logging
-import typing
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import (
@@ -23,7 +21,11 @@ from typing import (
     get_origin,
 )
 
+# HA Imports
+from homeassistant.components import history  # New import for history tool
+from homeassistant.components import conversation
 from homeassistant.components.homeassistant.exposed_entities import async_should_expose
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, Event, HomeAssistant, State
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import area_registry as ar
@@ -31,13 +33,20 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import floor_registry as fr
 from homeassistant.helpers import label_registry as lr
-from homeassistant.helpers import llm
 from homeassistant.helpers.event import async_call_later
-from xai_sdk.proto import chat_pb2  # Only for Tool proto; no 'tool' import
+
+# xAI Imports
+from xai_sdk.chat import tool
 
 from .const import MAX_SEARCH_RESULTS
 
 _LOGGER = logging.getLogger(__name__)
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(funcName)s - %(message)s",
+)
+
 
 TOOL_INSTRUCTIONS = ["'call_ha_service' with parameters: domain, service, target, data"]
 
@@ -197,14 +206,21 @@ class GrokHaTool:
     Instance created once on setup for sharing across conversations.
     """
 
-    def __init__(self, hass: HomeAssistant) -> None:
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize the GrokHaTool instance.
 
         Args:
             hass: Home Assistant core instance.
+            entry: Config entry for this integration (used for assistant_id).
         """
         _LOGGER.debug("Initializing GrokHaTool")
         self.hass = hass
+        self.entry = entry
+        # Use conversation.DOMAIN for exposed entities lookup in modern HA
+        self.assistant_id = conversation.DOMAIN
+        _LOGGER.debug(
+            "Computed assistant_id for exposed_entities: %s", self.assistant_id
+        )
         self.ent_reg = er.async_get(hass)
         self.area_reg = ar.async_get(hass)
         self.floor_reg = fr.async_get(hass)
@@ -215,7 +231,7 @@ class GrokHaTool:
         # Cache for optimization
         self._ha_context_summary_cache: Optional[str] = None
 
-        # Setup listeners
+        # Setup listeners (assuming the listener setup/cleanup logic remains the same)
         self._registry_remove = self.hass.bus.async_listen(
             "entity_registry_updated", self._async_invalidate_cache
         )
@@ -223,15 +239,38 @@ class GrokHaTool:
             "state_changed", self._async_debounced_invalidate_cache
         )
 
+    async def _notify_exposed_entities_fallback(self) -> None:
+        """Notify user via persistent notification if fallback is active."""
+        try:
+            await self.hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "title": "Grok xAI Integration Warning",
+                    "message": (
+                        "Exposed entities module import failed; assuming"
+                        "all entities are exposed. "
+                        "This may affect security—check HA logs and core installation."
+                    ),
+                },
+            )
+        except Exception as e:
+            _LOGGER.error(
+                "Failed to create notification for exposed_entities fallback: %s", e
+            )
+
     async def _async_invalidate_cache(self, event: Event) -> None:
         """Invalidate caches on registry/state updates.
 
         Args:
             event: HA event triggering invalidation.
         """
-        self._exposed_entities = None
-        self._ha_context_summary_cache = None
-        _LOGGER.debug("Caches invalidated by event: %s", event.event_type)
+        try:
+            self._exposed_entities = None
+            self._ha_context_summary_cache = None
+            _LOGGER.debug("Caches invalidated by event: %s", event.event_type)
+        except Exception as e:
+            _LOGGER.error("Error invalidating caches: %s", e)
 
     async def _async_debounced_invalidate_cache(self, event: Event) -> None:
         """Debounced cache invalidation for state changes.
@@ -257,261 +296,292 @@ class GrokHaTool:
             self._state_remove = None
         if self._debounce_call:
             self._debounce_call()
+            self._debounce_call = None
         self._exposed_entities = None
         self._ha_context_summary_cache = None
-        _LOGGER.debug("GrokHaTool listeners unloaded")
-
-    def get_tool_schemas(self) -> Sequence[chat_pb2.Tool]:
-        """Generate xAI-compatible tool schemas from public async methods.
-
-        Auto-detects tools as non-private async methods;
-        generates schemas from annotations/docstrings.
-
-        Returns:
-            List of chat_pb2.Tool protos.
-        """
-        tools = []
-        for name, method in inspect.getmembers(self, inspect.ismethod):
-            if name.startswith("_") or not inspect.iscoroutinefunction(method):
-                continue  # Skip private or sync methods
-            doc = inspect.getdoc(method) or ""
-            descriptions = parse_docstring_descriptions(doc)
-            params = inspect.signature(method).parameters
-            param_schemas = {
-                p.name: type_to_schema(p.annotation, descriptions, p.name)
-                for p in params.values()
-                if p.name != "self"
-            }
-            schema = {
-                "type": "object",
-                "properties": param_schemas,
-                "required": [
-                    p.name
-                    for p in params.values()
-                    if p.default == inspect.Parameter.empty and p.name != "self"
-                ],
-            }
-            tool_desc = doc.splitlines()[0] if doc else f"Tool: {name}"
-            tools.append(
-                chat_pb2.Tool(
-                    function=chat_pb2.Function(
-                        name=name,
-                        description=tool_desc,
-                        parameters=json.dumps(schema),
-                    )
-                )
-            )
-            _LOGGER.debug("Generated tool schema for: %s", name)
-        if not tools:
-            _LOGGER.warning("No tool schemas generated; check for public async methods")
-        return tools
+        _LOGGER.debug("Listeners unloaded and caches cleared")
 
     async def async_get_ha_context_summary(self) -> str:
-        """Generate a summary of HA configuration for Grok context.
-
-        Includes floors, areas, domains, etc. Cached for performance.
+        """Generate a structured summary of HA context (floors, areas, domains).
 
         Returns:
             Formatted string summary.
         """
-        if self._ha_context_summary_cache:
+        if self._ha_context_summary_cache is not None:
             _LOGGER.debug("Returning cached HA context summary")
             return self._ha_context_summary_cache
 
+        _LOGGER.debug("Generating new HA context summary")
         try:
-            floors = self.floor_reg.async_list_floors()
-            areas = self.area_reg.async_list_areas()
-            entities = list(
-                self.ent_reg.entities.values()
-            )  # Optimized: values() for efficiency
-            domains = {entry.domain for entry in entities if entry.domain}
+            summary_lines = ["Home Assistant Context:"]
 
-            summary = "Home Assistant Context:\n"
-            summary += (
-                f"- Floors: {', '.join(f.name for f in floors if f.name) or 'None'}\n"
-            )
-            for floor in floors:
-                floor_areas = [a for a in areas if a.floor_id == floor.floor_id]
-                summary += (
-                    f"  - {floor.name or 'Unnamed'}: "
-                    f"Areas - {', '.join(a.name for a in floor_areas
-                                         if a.name) or 'None'}\n"
+            # Create a map of floor_id -> floor_name
+            floor_map = {
+                f.floor_id: f.name
+                for f in self.floor_reg.async_list_floors()
+                if f.floor_id and f.name
+            }
+
+            # Create a structured map of floor_id -> list of area_names
+            floor_areas: Dict[Optional[str], List[str]] = {
+                floor_id: [] for floor_id in floor_map
+            }
+            floor_areas[None] = []  # For areas not assigned to a floor
+
+            # Populate the floor_areas map
+            for area in self.area_reg.async_list_areas():
+                if area.name:
+                    if area.floor_id in floor_areas:
+                        floor_areas[area.floor_id].append(area.name)
+                    else:
+                        floor_areas[None].append(area.name)  # Add to unassigned
+
+            # Build the structured summary string
+            if not floor_map and not floor_areas[None]:
+                summary_lines.append("- No floors or areas are configured.")
+
+            for floor_id, floor_name in floor_map.items():
+                summary_lines.append(f'- Floor: "{floor_name}"')
+                if floor_areas[floor_id]:
+                    areas_str = ", ".join(sorted(floor_areas[floor_id]))
+                    summary_lines.append(f"  - Areas: {areas_str}")
+                else:
+                    summary_lines.append("  - Areas: None")
+
+            if floor_areas[None]:
+                unassigned_areas_str = ", ".join(sorted(floor_areas[None]))
+                summary_lines.append(f"- Areas with no floor: {unassigned_areas_str}")
+
+            # Add available domains
+            domains = list(
+                set(
+                    e.domain
+                    for e in self.ent_reg.entities.values()
+                    if hasattr(e, "domain") and isinstance(e.domain, str)
                 )
-            summary += f"- Domains: {', '.join(sorted(domains)) or 'None'}\n"
-            summary += "- Use tools like find_entities_advanced for detailed queries.\n"
+            )
+            if domains:
+                summary_lines.append(
+                    f"- Available Domains: {', '.join(sorted(domains))}"
+                )
 
+            summary_lines.append(
+                "Use this context to disambiguate entities and locations."
+            )
+
+            summary = "\n".join(summary_lines)
             self._ha_context_summary_cache = summary
-            _LOGGER.info("Generated HA context summary")
+            _LOGGER.debug("Generated HA context summary:\n%s", summary)
             return summary
         except Exception as e:
-            _LOGGER.error("Failed to generate HA context summary: %s", e)
-            raise HomeAssistantError(f"Context summary error: {str(e)}")
+            _LOGGER.error("Failed to generate HA context summary: %s", e, exc_info=True)
+            return "HA context summary unavailable due to error."
 
-    async def call_ha_service(
-        self,
-        domain: str,
-        service: str,
-        target: Optional[Dict[str, Any]] = None,
-        data: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Call a Home Assistant service.
-
-        Args:
-            domain: Service domain (e.g., 'light').
-            service: Service name (e.g., 'turn_on').
-            target: Target entity/area/device
-                    (JSON dict, e.g., {'entity_id': 'light.bedroom'}).
-            data: Service data (JSON dict, e.g., {'brightness_pct': 50}).
+    def get_tool_schemas(self) -> Sequence[Any]:
+        """Generate tool schemas from methods using the xai_sdk.chat.tool helper.
 
         Returns:
-            Dict with status and message.
+            List of xAI tool helper objects.
         """
-        try:
-            _LOGGER.debug(
-                "Calling service: %s.%s with target=%s, data=%s",
-                domain,
-                service,
-                target,
-                data,
-            )
-            await self.hass.services.async_call(
-                domain, service, target=target, service_data=data
-            )
-            return {"status": "success", "message": f"Called {domain}.{service}"}
-        except Exception as e:
-            _LOGGER.error("Service call failed: %s", e)
-            return {"status": "error", "message": str(e)}
+        _LOGGER.debug("Starting tool schema generation...")
+        tools = []
+
+        # Methods to explicitly exclude from being exposed as tools
+        EXCLUDE_METHODS = {
+            "async_get_ha_context_summary",
+            "get_tool_schemas",
+            "async_unload_listeners",
+            "get_exposed_entities",
+        }
+
+        for name, method in inspect.getmembers(self):
+            # Filter 1: Must be callable
+            if not callable(method):
+                continue
+
+            # Filter 2: Skip private/dunder methods
+            if name.startswith("_"):
+                continue
+
+            # Filter 3: Skip methods on the exclusion list
+            if name in EXCLUDE_METHODS:
+                _LOGGER.debug("Skipping '%s' (in EXCLUDE_METHODS)", name)
+                continue
+
+            # We found a valid tool method. Proceed with schema generation.
+            _LOGGER.debug("Found potential tool method: %s", name)
+            doc = inspect.getdoc(method)
+            descriptions = parse_docstring_descriptions(doc or "")
+
+            try:
+                params = inspect.signature(method).parameters
+            except (ValueError, TypeError) as e:
+                # Happens on some built-in callables
+                _LOGGER.debug("Could not get signature for %s: %s", name, e)
+                continue
+
+            param_schemas = {}
+            required_params = []
+
+            for param_name, param in params.items():
+                if param.annotation is inspect.Parameter.empty:
+                    _LOGGER.warning(
+                        (
+                            "Skipping parameter '%s' in tool '%s': "
+                            "missing type annotation."
+                        ),
+                        param_name,
+                        name,
+                    )
+                    continue
+
+                param_schemas[param_name] = type_to_schema(
+                    param.annotation, descriptions, param_name
+                )
+                if param.default is inspect.Parameter.empty:
+                    required_params.append(param_name)
+
+            try:
+                # This is the JSON Schema structure (OpenAI style)
+                # that the tool() helper function expects.
+                parameters_dict = {
+                    "type": "object",
+                    "properties": param_schemas,
+                    "required": required_params,
+                }
+
+                # Use the xai_sdk.chat.tool helper function.
+                # This is the key change to fix the TypeError.
+                tools.append(
+                    tool(
+                        name=name,
+                        description=doc or f"No description for {name}",
+                        parameters=parameters_dict,
+                    )
+                )
+                _LOGGER.debug(
+                    "Created tool schema for %s using SDK helper: %s",
+                    name,
+                    parameters_dict,
+                )
+
+            except Exception as e:
+                _LOGGER.error(
+                    "Failed to create tool schema for %s: %s", name, e, exc_info=True
+                )
+                continue  # Skip invalid tools to avoid full failure
+
+        _LOGGER.info("Generated %d tool schemas", len(tools))
+        return tools
 
     async def async_search_entities(
         self,
         name: Optional[str] = None,
-        entity_globs: Optional[Union[str, List[str]]] = None,
-        domains: Optional[Union[str, List[str]]] = None,
-        area_globs: Optional[Union[str, List[str]]] = None,
-        floor_globs: Optional[Union[str, List[str]]] = None,
-        tag_globs: Optional[Union[str, List[str]]] = None,
-        device_globs: Optional[Union[str, List[str]]] = None,
-        filters: Optional[Union[str, Dict[str, Any]]] = None,
+        entity_globs: Optional[str] = None,
+        device_globs: Optional[str] = None,
+        area_globs: Optional[str] = None,
+        floor_globs: Optional[str] = None,
+        tag_globs: Optional[str] = None,
         limit: int = MAX_SEARCH_RESULTS,
         offset: int = 0,
         simple_mode: bool = False,
-    ) -> Union[List[Dict[str, Any]], str]:
-        """Search for exposed entities with filters.
+    ) -> Union[str, List[Dict[str, Any]]]:
+        """Search for entities matching criteria.
 
         Args:
-            name: Simple name search (simple_mode only).
-            entity_globs: Glob patterns for entity IDs.
-            domains: Domain(s) to match (e.g., 'light').
-            area_globs: Glob patterns for areas.
-            floor_globs: Glob patterns for floors.
-            tag_globs: Glob patterns for labels.
-            device_globs: Glob patterns for devices.
-            filters: Dict with 'domain' or 'attributes'.
-            limit: Max results (default 10).
-            offset: Result offset.
-            simple_mode: Basic name-based search.
+            name: Entity name or partial name.
+            entity_globs: Glob patterns for entity IDs (comma-separated).
+            device_globs: Glob patterns for device names (comma-separated).
+            area_globs: Glob patterns for area names (comma-separated).
+            floor_globs: Glob patterns for floor names (comma-separated).
+            tag_globs: Glob patterns for labels (comma-separated).
+            limit: Max results to return.
+            offset: Offset for pagination.
+            simple_mode: If true, use simple keyword search.
 
         Returns:
-            List of matching entity dicts or error message.
+            List of matching entity dicts or message if none found.
         """
         try:
             exposed = await self.get_exposed_entities()
-        except HomeAssistantError as e:
-            _LOGGER.error("Error fetching exposed entities: %s", e)
-            return f"Error: {str(e)}"
+            matching = []
+            entity_globs_list = [
+                g.strip() for g in (entity_globs or "").split(",") if g.strip()
+            ]
+            device_globs_list = [
+                g.strip() for g in (device_globs or "").split(",") if g.strip()
+            ]
+            area_globs_list = [
+                g.strip() for g in (area_globs or "").split(",") if g.strip()
+            ]
+            floor_globs_list = [
+                g.strip() for g in (floor_globs or "").split(",") if g.strip()
+            ]
+            tag_globs_list = [
+                g.strip() for g in (tag_globs or "").split(",") if g.strip()
+            ]
 
-        if isinstance(filters, str):
-            try:
-                filters = json.loads(filters)
-                _LOGGER.debug("Successfully parsed filters from string to dict")
-            except json.JSONDecodeError as e:
-                _LOGGER.warning("Invalid filters JSON: %s", e)
-                return f"Invalid filters: {str(e)}"
+            floor_id_to_name = {
+                f.id: f.name
+                for f in self.floor_reg.async_list_floors()
+                if hasattr(f, "id") and hasattr(f, "name")
+            }
+            label_id_to_name = {
+                lbl.label_id: lbl.name
+                for lbl in self.label_reg.async_list_labels()
+                if hasattr(lbl, "label_id") and hasattr(lbl, "name")
+            }
 
-        # Type narrowing: After parsing, filters is either None or dict
-        if filters is not None and not isinstance(filters, dict):
-            _LOGGER.error("Unexpected parsed filters type: %s", type(filters))
-            return "Error: Invalid filters type"
-
-        def ensure_list(value: Optional[Union[str, List[str]]]) -> List[str]:
-            if value is None:
-                return []
-            if isinstance(value, str):
-                return [value.strip()]
-            return value
-
-        domains_list = ensure_list(domains) or ensure_list(
-            filters.get("domain") if filters else None
-        )
-        entity_globs_list = ensure_list(entity_globs)
-        area_globs_list = ensure_list(area_globs)
-        floor_globs_list = ensure_list(floor_globs)
-        tag_globs_list = ensure_list(tag_globs)
-        device_globs_list = ensure_list(device_globs)
-        attr_filters = filters.get("attributes", {}) if filters else {}
-
-        # Cached maps
-        floor_id_to_name = {
-            entry.floor_id: entry.name or ""
-            for entry in self.floor_reg.async_list_floors()
-        }
-
-        label_id_to_name = {
-            entry.label_id: entry.name or ""
-            for entry in self.label_reg.async_list_labels()
-        }
-
-        matching = []
-        for exp in exposed:
-            entity_id = exp["entity_id"]
-            entry = self.ent_reg.async_get(entity_id)
-            if not entry:
-                continue
-
-            if domains_list and entry.domain not in domains_list:
-                continue
-
-            state = self.hass.states.get(entity_id)
-            if not state:
-                continue
-            if attr_filters and not all(
-                state.attributes.get(k) == v for k, v in attr_filters.items()
-            ):
-                continue
-
-            if simple_mode:
-                if not name:
-                    return [{"message": "Name required for simple search"}]
-                words = name.lower().split()
-                score = sum(
-                    1
-                    for word in words
-                    if word in exp["name"].lower()
-                    or word in entity_id.lower()
-                    or word in exp["area_name"].lower()
-                )
-                if score == 0:
+            for exp in exposed:
+                entity_id = exp["entity_id"]
+                entry = self.ent_reg.async_get(entity_id)
+                if not entry:
                     continue
-            else:
-                if entity_globs_list and not any(
-                    fnmatch.fnmatch(entity_id, g) for g in entity_globs_list
-                ):
+                state = self.hass.states.get(entity_id)
+                if not state:
                     continue
-                if device_globs_list and not any(
-                    fnmatch.fnmatch(exp["device_name"], g) for g in device_globs_list
-                ):
-                    continue
-                if area_globs_list and not any(
-                    fnmatch.fnmatch(exp["area_name"], g) for g in area_globs_list
-                ):
-                    continue
-                area_id = (
-                    entry.area_id
-                    or (
-                        self.dev_reg.async_get(entry.device_id).area_id
-                        if entry.device_id
-                        else None
+
+                # --- RESTRUCTURED FILTER LOGIC ---
+                # All filters are now AND conditions.
+                # If a filter is provided, it must pass.
+
+                # Filter 1: Simple Mode Name Search
+                if simple_mode and name:
+                    words = name.lower().split()
+                    score = sum(
+                        1
+                        for word in words
+                        if word in exp["name"].lower()
+                        or word in entity_id.lower()
+                        or word in exp["area_name"].lower()
                     )
+                    if score == 0:
+                        continue  # Failed simple search, skip this entity
+
+                # Filter 2: Entity Globs
+                if entity_globs_list and not any(
+                    fnmatch.fnmatch(entity_id.lower(), g.lower())
+                    for g in entity_globs_list
+                ):
+                    continue  # Failed entity glob, skip
+
+                # Filter 3: Device Globs
+                if device_globs_list and not any(
+                    fnmatch.fnmatch(exp["device_name"].lower(), g.lower())
+                    for g in device_globs_list
+                ):
+                    continue  # Failed device glob, skip
+
+                # Filter 4: Area Globs
+                if area_globs_list and not any(
+                    fnmatch.fnmatch(exp["area_name"].lower(), g.lower())
+                    for g in area_globs_list
+                ):
+                    continue  # Failed area glob, skip
+
+                # Filter 5: Floor Globs
+                area_id = entry.area_id or (
+                    self.dev_reg.async_get(entry.device_id).area_id
                     if entry.device_id
                     else None
                 )
@@ -520,36 +590,61 @@ class GrokHaTool:
                     area = self.area_reg.async_get_area(area_id)
                     if area and area.floor_id:
                         floor_name = floor_id_to_name.get(area.floor_id, "")
+
                 if floor_globs_list and not any(
-                    fnmatch.fnmatch(floor_name, g) for g in floor_globs_list
+                    fnmatch.fnmatch(floor_name.lower(), g.lower())
+                    for g in floor_globs_list
                 ):
-                    continue
+                    continue  # Failed floor glob, skip
+
+                # Filter 6: Tag/Label Globs
                 if (
                     tag_globs_list
                     and entry.labels
                     and not any(
-                        fnmatch.fnmatch(label_id_to_name.get(lbl, ""), g)
+                        fnmatch.fnmatch(label_id_to_name.get(lbl, ""), g.lower())
                         for lbl in entry.labels
                         for g in tag_globs_list
                     )
                 ):
-                    continue
+                    continue  # Failed tag glob, skip
 
-            matching.append(
-                {
-                    "entity_id": entity_id,
-                    "name": exp["name"],
-                    "area_name": exp["area_name"],
-                    "device_name": exp["device_name"],
-                    "state": state.state,
-                    "unit": state.attributes.get("unit_of_measurement"),
-                    "attributes": make_json_serializable(state.attributes),
-                }
+                # --- END RESTRUCTURED FILTER LOGIC ---
+
+                # If we got here, all provided filters passed.
+                matching.append(
+                    {
+                        "entity_id": entity_id,
+                        "name": exp["name"],
+                        "area_name": exp["area_name"],
+                        "device_name": exp["device_name"],
+                        "state": state.state,
+                        "unit": state.attributes.get("unit_of_measurement"),
+                        "attributes": make_json_serializable(state.attributes),
+                    }
+                )
+
+            if not matching:
+                # Add improved logging
+                _LOGGER.warning(
+                    (
+                        "Search with args (name=%s, area_globs=%s, simple_mode=%s) "
+                        "found 0 entities."
+                    ),
+                    name,
+                    area_globs,
+                    simple_mode,
+                )
+                return "No matching entities found"
+
+            _LOGGER.debug(
+                "Search found %d matches. Returning up to %d.", len(matching), limit
             )
+            return matching[offset : offset + limit]
 
-        if not matching:
-            return "No matching entities found"
-        return matching[offset : offset + limit]
+        except Exception as e:
+            _LOGGER.error("Error in async_search_entities: %s", e, exc_info=True)
+            return "Error searching entities"
 
     async def get_exposed_entities(self) -> List[Dict[str, Any]]:
         """Fetch list of exposed entities with details (cached).
@@ -562,85 +657,181 @@ class GrokHaTool:
             return self._exposed_entities
 
         try:
-            # Use DOMAIN from const.py for robust assistant_id matching
-            apis = llm.async_get_apis(self.hass)
-            assistant_id = typing.cast(
-                str,
-                next(
-                    (api.id for api in apis if api.id == "grok_xai_conversation"),
-                    "conversation",  # Fallback
-                ),
-            )
-
             exposed = []
-            for (
-                entry
-            ) in self.ent_reg.entities.values():  # Optimized: values() for all entities
-                if async_should_expose(self.hass, assistant_id, entry.entity_id):
+            _LOGGER.debug("Checking exposure for assistant ID: %s", conversation.DOMAIN)
+
+            for entry in self.ent_reg.entities.values():  # Optimized: values()
+                if async_should_expose(self.hass, conversation.DOMAIN, entry.entity_id):
                     area_name = ""
                     device_name = ""
-                    if entry.area_id:
-                        area = self.area_reg.async_get_area(entry.area_id)
-                        area_name = area.name if area else ""
+                    device = None  # Local var for device
                     if entry.device_id:
                         device = self.dev_reg.async_get(entry.device_id)
                         device_name = device.name if device else ""
+
+                    area = None  # Local var for area
+                    if entry.area_id:
+                        area = self.area_reg.async_get_area(entry.area_id)
+                        area_name = area.name if area else ""
+                    elif (
+                        entry.device_id and device and device.area_id
+                    ):  # Use cached device
+                        area = self.area_reg.async_get_area(device.area_id)
+                        area_name = area.name if area else ""
+
                     exposed.append(
                         {
                             "entity_id": entry.entity_id,
-                            "name": entry.name or entry.original_name,
+                            "name": entry.name
+                            or entry.original_name
+                            or entry.entity_id,  # Fallback to entity_id
                             "area_name": area_name,
                             "device_name": device_name,
                             "aliases": entry.aliases,
                         }
                     )
+
             self._exposed_entities = exposed
-            _LOGGER.info("Fetched %d exposed entities", len(exposed))
+            _LOGGER.info(
+                "Fetched %d exposed entities for assistant_id %s",
+                len(exposed),
+                self.assistant_id,
+            )
             return exposed
         except Exception as e:
-            _LOGGER.error("Failed to fetch exposed entities: %s", e)
-            raise HomeAssistantError(str(e))
+            _LOGGER.error(
+                "Failed to fetch exposed entities for assistant_id %s: %s",
+                self.assistant_id,
+                e,
+                exc_info=True,
+            )
+            raise HomeAssistantError(f"Error fetching exposed entities: {str(e)}")
 
-    async def get_entity_state(self, entity_id: str) -> Dict[str, Any]:
-        """Fetch full state of an entity.
+    async def async_get_entity_history(
+        self,
+        entity_id: str,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+    ) -> Union[str, list[dict[str, Any] | list[Any] | str | int | float | None]]:
+        """Retrieve the historical state of an entity over a period of time.
 
+        The history component must be enabled for this to work.
         Args:
-            entity_id: Entity ID (e.g., 'sensor.bedroom_temperature').
+            entity_id: The ID of the entity to retrieve history for
+                       (e.g., 'sensor.temperature').
+            start_time: Optional ISO 8601 timestamp string for
+                        the start of the period.
+            end_time: Optional ISO 8601 timestamp string for the end of the period.
 
         Returns:
-            Dict with state details or error message.
-        """
-        state = self.hass.states.get(entity_id)
-        if not state:
-            _LOGGER.warning("Entity not found: %s", entity_id)
-            return {"message": "Entity not found"}
-        # Cast to Dict[str, Any] since we know as_dict()
-        # produces a dict and serialization preserves it
-        return typing.cast(Dict[str, Any], make_json_serializable(state.as_dict()))
-
-    async def set_thermostat_temp(
-        self, entity_id: str, temperature: float
-    ) -> Dict[str, Any]:
-        """Set thermostat temperature.
-
-        Args:
-            entity_id: Thermostat entity ID (e.g., 'climate.living_room').
-            temperature: Target temperature (e.g., 72.5).
-
-        Returns:
-            Dict with status and message.
+            List of lists of state dictionaries, or an error message string.
         """
         try:
-            await self.hass.services.async_call(
-                "climate",
-                "set_temperature",
-                {"entity_id": entity_id},
-                {"temperature": temperature},
+            _start = datetime.fromisoformat(start_time) if start_time else None
+            _end = datetime.fromisoformat(end_time) if end_time else None
+
+            # History component returns [entity_id: [StateObject, ...]]
+            history_data = await history.get_period(
+                self.hass,
+                end_time=_end,
+                start_time=_start,
+                entity_id=entity_id,
+                include_start_time=True,
+                no_attributes=False,
             )
+
+            if not history_data or not history_data.get(entity_id):
+                return (
+                    f"No history found for entity: {entity_id} in the specified period."
+                )
+
+            # Convert HA State objects to a serializable list of dictionaries
+            serialized_history = [
+                make_json_serializable(state) for state in history_data[entity_id]
+            ]
+
+            _LOGGER.debug(
+                "Retrieved %d history entries for %s",
+                len(serialized_history),
+                entity_id,
+            )
+
+            # History.get_period returns a dict, but we simplify the output for Grok
+            return serialized_history
+
+        except ValueError as e:
+            _LOGGER.error("Invalid time format for history tool: %s", e)
+            return (
+                "Error: Invalid time format. Ensure start_time "
+                "and end_time are in valid ISO 8601 format."
+            )
+        except Exception as e:
+            _LOGGER.error(
+                "Error retrieving entity history for %s: %s",
+                entity_id,
+                e,
+                exc_info=True,
+            )
+            return f"Error retrieving history: {str(e)}"
+
+    async def async_run_automation(
+        self,
+        entity_id: str,
+    ) -> Dict[str, str]:
+        """Trigger a Home Assistant automation entity.
+
+        This is useful for activating pre-configured complex actions.
+        Args:
+            entity_id: The entity ID of the automation to trigger
+                        (e.g., 'automation.morning_routine').
+
+        Returns:
+            A status dictionary indicating success or failure.
+        """
+        domain = entity_id.split(".")[0]
+        if domain != "automation":
+            return {
+                "status": "error",
+                "message": (
+                    "Entity ID {entity_id} is not an automation."
+                    "Only 'automation' domain entities can be run."
+                ),
+            }
+
+        try:
+            # Service call to trigger the automation
+            await self.hass.services.async_call(
+                domain="automation",
+                service="trigger",
+                target={"entity_id": entity_id},
+                blocking=True,  # Wait for the service to complete
+                context=None,
+            )
+
+            _LOGGER.info("Successfully triggered automation: %s", entity_id)
             return {
                 "status": "success",
-                "message": f"Set {entity_id} to {temperature} degrees",
+                "message": f"Successfully triggered automation: {entity_id}",
+            }
+        except HomeAssistantError as e:
+            _LOGGER.error(
+                "Home Assistant error running automation %s: %s", entity_id, e
+            )
+            return {
+                "status": "error",
+                "message": (
+                    "Home Assistant Error: Could not trigger"
+                    f"automation {entity_id}. Reason: {str(e)}"
+                ),
             }
         except Exception as e:
-            _LOGGER.error("Failed to set thermostat: %s", e)
-            return {"status": "error", "message": str(e)}
+            _LOGGER.error(
+                "Unexpected error running automation %s: %s",
+                entity_id,
+                e,
+                exc_info=True,
+            )
+            return {
+                "status": "error",
+                "message": f"Unexpected error while triggering automation {entity_id}.",
+            }

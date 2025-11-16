@@ -7,7 +7,7 @@ import random
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional
 
 import grpc  # For RpcError
 from homeassistant.components.conversation import (
@@ -26,7 +26,6 @@ from xai_sdk.aio.chat import Chat, Response
 
 # Explicitly import the helper functions as requested
 from xai_sdk.chat import assistant, system, tool_result, user
-from xai_sdk.proto import chat_pb2
 
 from .const import (
     AREA_CONTEXT_TEMPLATE,
@@ -79,8 +78,11 @@ class GrokConversationAgent(AbstractConversationAgent):  # type: ignore
             self.base_prompt = prompt or DEFAULT_PROMPT
 
             # Get tool schemas from the passed instance
-            self.tools: Sequence[chat_pb2.Tool] = self.ha_tools.get_tool_schemas()
-            _LOGGER.debug("Loaded %d tool schemas successfully", len(self.tools))
+            # REMOVED the type hint: Sequence[chat_pb2.Tool]
+            self.tools = self.ha_tools.get_tool_schemas()
+            _LOGGER.debug(
+                "Loaded %d tool schemas successfully\n%s", len(self.tools), self.tools
+            )
         except Exception as e:
             _LOGGER.error(
                 "Failed to initialize tools in GrokConversationAgent: %s",
@@ -168,7 +170,9 @@ class GrokConversationAgent(AbstractConversationAgent):  # type: ignore
                 # Call the method from the ha_tools instance instead
                 ha_context_summary = await self.ha_tools.async_get_ha_context_summary()
                 _LOGGER.debug(
-                    "Fetched HA context summary for conversation %s", conversation_id
+                    "Fetched HA context summary for conversation %s\n%s",
+                    conversation_id,
+                    ha_context_summary,
                 )
                 # --- END MODIFICATION ---
 
